@@ -51,17 +51,44 @@ class HealthConnectManager(private val context: Context) {
     val permissions: Set<String> =
         metrics.map { HealthPermission.getReadPermission(it.recordType) }.toSet()
 
+    /** The four types sent to VitaClaw (v1 contract). */
+    val exportPermissions: Set<String> = setOf(
+        HealthPermission.getReadPermission(HeartRateRecord::class),
+        HealthPermission.getReadPermission(SleepSessionRecord::class),
+        HealthPermission.getReadPermission(OxygenSaturationRecord::class),
+        HealthPermission.getReadPermission(ExerciseSessionRecord::class)
+    )
+
+    /** Lets the daily job read while the app is closed (Health Connect feature). */
+    val backgroundPermission = "android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND"
+
     suspend fun hasAllPermissions(): Boolean =
         healthConnectClient.permissionController.getGrantedPermissions()
             .containsAll(permissions)
 
+    suspend fun hasExportPermissions(): Boolean =
+        healthConnectClient.permissionController.getGrantedPermissions()
+            .containsAll(exportPermissions)
+
+    suspend fun canReadInBackground(): Boolean =
+        healthConnectClient.permissionController.getGrantedPermissions()
+            .contains(backgroundPermission)
+
+    /** Reads every page, not only the first (Health Connect pages large results). */
     suspend inline fun <reified T : Record> readRecords(start: Instant, end: Instant): List<T> {
-        val response = healthConnectClient.readRecords(
-            ReadRecordsRequest(
-                recordType = T::class,
-                timeRangeFilter = TimeRangeFilter.between(start, end)
+        val all = mutableListOf<T>()
+        var token: String? = null
+        do {
+            val response = healthConnectClient.readRecords(
+                ReadRecordsRequest(
+                    recordType = T::class,
+                    timeRangeFilter = TimeRangeFilter.between(start, end),
+                    pageToken = token
+                )
             )
-        )
-        return response.records
+            all += response.records
+            token = response.pageToken
+        } while (token != null)
+        return all
     }
 }

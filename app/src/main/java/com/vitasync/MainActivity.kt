@@ -17,8 +17,6 @@ import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.records.*
 import com.vitasync.ui.theme.VitaSyncTheme
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.time.Duration
 import java.time.Instant
@@ -30,6 +28,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         healthConnectManager = HealthConnectManager(this)
+        SyncWorker.schedule(this)   // daily send at about 22:00; keeps an existing schedule
 
         setContent {
             VitaSyncTheme {
@@ -49,10 +48,17 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var results by remember { mutableStateOf<List<MetricResult>>(emptyList()) }
     var status by remember { mutableStateOf("Ready") }
+    var lastSend by remember { mutableStateOf(VitaClawSender.lastResult(context)) }
+    var dailyAllowed by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        dailyAllowed = healthConnectManager.isAvailable() && healthConnectManager.canReadInBackground()
+    }
 
     val requestPermissionsLauncher = rememberLauncherForActivityResult(
         contract = PermissionController.createRequestPermissionResultContract()
     ) { granted ->
+        dailyAllowed = granted.contains(healthConnectManager.backgroundPermission) || dailyAllowed
         status = if (granted.containsAll(healthConnectManager.permissions))
             "Permissions granted. Tap Sync All."
         else
@@ -67,6 +73,21 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
         if (!healthConnectManager.hasAllPermissions()) {
             status = "Requesting permissions..."
             requestPermissionsLauncher.launch(healthConnectManager.permissions)
+            return false
+        }
+        return true
+    }
+
+    suspend fun ensureExportReady(): Boolean {
+        if (!healthConnectManager.isAvailable()) {
+            status = "Health Connect not available on this device."
+            return false
+        }
+        if (!healthConnectManager.hasExportPermissions()) {
+            status = "Requesting permissions..."
+            requestPermissionsLauncher.launch(
+                healthConnectManager.exportPermissions + healthConnectManager.backgroundPermission
+            )
             return false
         }
         return true
@@ -168,96 +189,10 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
         }
     }
 
-    // ---- Export: 4 Council-approved v1 types only ----
+    // ---- Export: 4 Council-approved v1 types only (built by ExportBuilder) ----
     suspend fun exportV1Json(): File {
-        val end = Instant.now()
-
-        val hrRecords = healthConnectManager.readRecords<HeartRateRecord>(end.minus(Duration.ofHours(24)), end)
-        val sleepRecords = healthConnectManager.readRecords<SleepSessionRecord>(end.minus(Duration.ofDays(7)), end)
-        val spo2Records = healthConnectManager.readRecords<OxygenSaturationRecord>(end.minus(Duration.ofDays(7)), end)
-        val exerciseRecords = healthConnectManager.readRecords<ExerciseSessionRecord>(end.minus(Duration.ofDays(14)), end)
-
-        val recordsArray = JSONArray()
-
-        hrRecords.forEach { rec ->
-            rec.samples.forEach { sample ->
-                recordsArray.put(JSONObject().apply {
-                    put("source", "health_connect")
-                    put("record_type", "heart_rate")
-                    put("source_app", rec.metadata.dataOrigin.packageName)
-                    put("source_record_id", rec.metadata.id)
-                    put("data_recorded_at", sample.time.toString())
-                    put("data_ingested_at", Instant.now().toString())
-                    put("data", JSONObject().apply {
-                        put("bpm", sample.beatsPerMinute)
-                    })
-                })
-            }
-        }
-
-        sleepRecords.forEach { rec ->
-            recordsArray.put(JSONObject().apply {
-                put("source", "health_connect")
-                put("record_type", "sleep_session")
-                put("source_app", rec.metadata.dataOrigin.packageName)
-                put("source_record_id", rec.metadata.id)
-                put("data_recorded_at", rec.startTime.toString())
-                put("data_ingested_at", Instant.now().toString())
-                put("data", JSONObject().apply {
-                    put("start_time", rec.startTime.toString())
-                    put("end_time", rec.endTime.toString())
-                    put("stage_count", rec.stages.size)
-                    put("stages", JSONArray().apply {
-                        rec.stages.forEach { stage ->
-                            put(JSONObject().apply {
-                                put("stage_type", stage.stage)
-                                put("start_time", stage.startTime.toString())
-                                put("end_time", stage.endTime.toString())
-                            })
-                        }
-                    })
-                })
-            })
-        }
-
-        spo2Records.forEach { rec ->
-            recordsArray.put(JSONObject().apply {
-                put("source", "health_connect")
-                put("record_type", "oxygen_saturation")
-                put("source_app", rec.metadata.dataOrigin.packageName)
-                put("source_record_id", rec.metadata.id)
-                put("data_recorded_at", rec.time.toString())
-                put("data_ingested_at", Instant.now().toString())
-                put("data", JSONObject().apply {
-                    put("percentage", rec.percentage.value)
-                })
-            })
-        }
-
-        exerciseRecords.forEach { rec ->
-            recordsArray.put(JSONObject().apply {
-                put("source", "health_connect")
-                put("record_type", "exercise_session")
-                put("source_app", rec.metadata.dataOrigin.packageName)
-                put("source_record_id", rec.metadata.id)
-                put("data_recorded_at", rec.startTime.toString())
-                put("data_ingested_at", Instant.now().toString())
-                put("data", JSONObject().apply {
-                    put("start_time", rec.startTime.toString())
-                    put("end_time", rec.endTime.toString())
-                    put("exercise_type", rec.exerciseType)
-                })
-            })
-        }
-
-        val root = JSONObject().apply {
-            put("_note", "REAL device export from VitaSync — Council-approved v1 scope only (heart_rate, sleep_session, oxygen_saturation, exercise_session). Generated on-device, not hand-fabricated.")
-            put("sync_run_at", Instant.now().toString())
-            put("schema_version", 1)
-            put("records", recordsArray)
-        }
-
-        val exportDir = File(healthConnectManager.healthConnectClient.let { context.cacheDir }, "exports")
+        val root = ExportBuilder.build(healthConnectManager)
+        val exportDir = File(context.cacheDir, "exports")
         exportDir.mkdirs()
         val file = File(exportDir, "vitasync_export_${System.currentTimeMillis()}.json")
         file.writeText(root.toString(2))
@@ -301,6 +236,34 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
         }) {
             Text("Export v1 JSON")
         }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Button(onClick = {
+            scope.launch {
+                if (!ensureExportReady()) return@launch
+                status = "Sending to VitaClaw..."
+                val outcome = VitaClawSender.send(ExportBuilder.build(healthConnectManager))
+                VitaClawSender.remember(context, outcome, "manual")
+                lastSend = VitaClawSender.lastResult(context)
+                status = if (outcome.ok) "Sent to VitaClaw." else "Send failed: ${outcome.summary}"
+            }
+        }) {
+            Text("Send to VitaClaw now")
+        }
+
+        if (!dailyAllowed) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Button(onClick = {
+                requestPermissionsLauncher.launch(setOf(healthConnectManager.backgroundPermission))
+            }) {
+                Text("Allow daily send (background access)")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(text = "Daily send at about 22:00: " + if (dailyAllowed) "on" else "needs background access")
+        Text(text = "Last send: $lastSend")
 
         Spacer(modifier = Modifier.height(16.dp))
 
