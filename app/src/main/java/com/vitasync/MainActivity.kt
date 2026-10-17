@@ -28,7 +28,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         healthConnectManager = HealthConnectManager(this)
-        SyncWorker.schedule(this)   // daily send at about 22:00; keeps an existing schedule
+        SyncWorker.schedule(this)   // daily send at about 08:00; keeps a day already booked
 
         setContent {
             VitaSyncTheme {
@@ -262,7 +262,7 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
         }
 
         Spacer(modifier = Modifier.height(8.dp))
-        Text(text = "Daily send at about 22:00: " + if (dailyAllowed) "on" else "needs background access")
+        Text(text = "Daily send at about 0${SyncWorker.SEND_HOUR}:00: " + if (dailyAllowed) "on" else "needs background access")
         Text(text = "Last send: $lastSend")
 
         Spacer(modifier = Modifier.height(16.dp))

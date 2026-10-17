@@ -4,6 +4,8 @@ import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.OxygenSaturationRecord
 import androidx.health.connect.client.records.SleepSessionRecord
+import androidx.health.connect.client.records.metadata.Device
+import androidx.health.connect.client.records.metadata.Metadata
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Duration
@@ -17,6 +19,10 @@ import java.time.Instant
  *
  * A type whose permission is not granted is skipped, not an error
  * (contract rule 6: partial batches are valid).
+ *
+ * Each record's data carries "device" (manufacturer, model, type) when the
+ * app that wrote it to Health Connect recorded one; it is left out when not.
+ * VitaClaw stores data as given, so no receiver change is needed.
  */
 object ExportBuilder {
 
@@ -35,6 +41,30 @@ object ExportBuilder {
             put("data_ingested_at", Instant.now().toString())
         }
 
+    private fun deviceType(type: Int): String = when (type) {
+        Device.TYPE_WATCH -> "watch"
+        Device.TYPE_PHONE -> "phone"
+        Device.TYPE_SCALE -> "scale"
+        Device.TYPE_RING -> "ring"
+        Device.TYPE_HEAD_MOUNTED -> "head_mounted"
+        Device.TYPE_FITNESS_BAND -> "fitness_band"
+        Device.TYPE_CHEST_STRAP -> "chest_strap"
+        Device.TYPE_SMART_DISPLAY -> "smart_display"
+        else -> "unknown"
+    }
+
+    /** Adds "device" to a record's data when Health Connect has one for it. */
+    private fun JSONObject.withDevice(metadata: Metadata): JSONObject {
+        val device = metadata.device ?: return this
+        if (device.manufacturer == null && device.model == null && device.type == Device.TYPE_UNKNOWN) return this
+        put("device", JSONObject().apply {
+            put("manufacturer", device.manufacturer ?: JSONObject.NULL)
+            put("model", device.model ?: JSONObject.NULL)
+            put("type", deviceType(device.type))
+        })
+        return this
+    }
+
     private suspend fun <T> readOrSkip(block: suspend () -> List<T>): List<T> =
         try {
             block()
@@ -50,7 +80,7 @@ object ExportBuilder {
                 rec.samples.forEach { sample ->
                     records.put(base("heart_rate", rec.metadata.dataOrigin.packageName,
                         rec.metadata.id, sample.time).apply {
-                        put("data", JSONObject().put("bpm", sample.beatsPerMinute))
+                        put("data", JSONObject().put("bpm", sample.beatsPerMinute).withDevice(rec.metadata))
                     })
                 }
             }
@@ -72,7 +102,7 @@ object ExportBuilder {
                                 })
                             }
                         })
-                    })
+                    }.withDevice(rec.metadata))
                 })
             }
 
@@ -80,7 +110,7 @@ object ExportBuilder {
             .forEach { rec ->
                 records.put(base("oxygen_saturation", rec.metadata.dataOrigin.packageName,
                     rec.metadata.id, rec.time).apply {
-                    put("data", JSONObject().put("percentage", rec.percentage.value))
+                    put("data", JSONObject().put("percentage", rec.percentage.value).withDevice(rec.metadata))
                 })
             }
 
@@ -92,7 +122,7 @@ object ExportBuilder {
                         put("start_time", rec.startTime.toString())
                         put("end_time", rec.endTime.toString())
                         put("exercise_type", rec.exerciseType)
-                    })
+                    }.withDevice(rec.metadata))
                 })
             }
 
