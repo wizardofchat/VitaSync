@@ -28,7 +28,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         healthConnectManager = HealthConnectManager(this)
-        SyncWorker.schedule(this)   // daily send at about 08:00; keeps a day already booked
+        SyncWorker.scheduleNextDaily(this)   // daily send at about 08:00; KEEP preserves a pending retry
 
         setContent {
             VitaSyncTheme {
@@ -48,7 +48,7 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var results by remember { mutableStateOf<List<MetricResult>>(emptyList()) }
     var status by remember { mutableStateOf("Ready") }
-    var lastSend by remember { mutableStateOf(VitaClawSender.lastResult(context)) }
+    var lastSend by remember { mutableStateOf(VitaClawSender.lastSendLine(context)) }
     var dailyAllowed by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
@@ -190,12 +190,20 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
     }
 
     // ---- Export: 4 Council-approved v1 types only (built by ExportBuilder) ----
+    // Local file dump: fixed 30-day window, no chunking, no overlap, cursors
+    // untouched. The "Send to VitaClaw" button uses the cursor instead.
     suspend fun exportV1Json(): File {
-        val root = ExportBuilder.build(healthConnectManager)
+        val fixedStart = Instant.now().minus(Duration.ofDays(30))
+        val build = ExportBuilder.build(
+            healthConnectManager,
+            cursorFor = { fixedStart },
+            maxChunkDays = 365L * 100,
+            overlapHours = 0
+        )
         val exportDir = File(context.cacheDir, "exports")
         exportDir.mkdirs()
         val file = File(exportDir, "vitasync_export_${System.currentTimeMillis()}.json")
-        file.writeText(root.toString(2))
+        file.writeText(build.json.toString(2))
         return file
     }
 
@@ -243,9 +251,16 @@ fun SyncScreen(healthConnectManager: HealthConnectManager) {
             scope.launch {
                 if (!ensureExportReady()) return@launch
                 status = "Sending to VitaClaw..."
-                val outcome = VitaClawSender.send(ExportBuilder.build(healthConnectManager))
-                VitaClawSender.remember(context, outcome, "manual")
-                lastSend = VitaClawSender.lastResult(context)
+                val build = ExportBuilder.build(healthConnectManager) { type ->
+                    VitaClawSender.cursorFor(context, type)
+                }
+                val outcome = VitaClawSender.send(build.json)
+                VitaClawSender.recordAttempt(context, outcome, "manual")
+                if (outcome.ok) {
+                    VitaClawSender.advanceCursors(context, build.windowEnds)
+                    SyncWorker.scheduleAfterSuccess(context, build.windowEnds)
+                }
+                lastSend = VitaClawSender.lastSendLine(context)
                 status = if (outcome.ok) "Sent to VitaClaw." else "Send failed: ${outcome.summary}"
             }
         }) {
