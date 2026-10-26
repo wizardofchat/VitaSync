@@ -3,7 +3,9 @@ package com.vitasync
 import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.OxygenSaturationRecord
+import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
+import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.metadata.Device
 import androidx.health.connect.client.records.metadata.Metadata
 import org.json.JSONArray
@@ -12,24 +14,36 @@ import java.time.Duration
 import java.time.Instant
 
 /**
- * Builds the v1 export (schema_version 1) that VitaClaw's receiver accepts.
- * Same four record types and the same record shape as the 9 October 2026
- * export. Windows overlap from one day to the next on purpose: VitaClaw
- * ignores a record it already holds, so a missed day is picked up next time.
+ * Builds the v1 export (schema_version 1): heart_rate, sleep_session,
+ * oxygen_saturation, exercise_session, plus resting_heart_rate and steps
+ * (added 26 Oct 2026: Garmin writes both; additive, existing record shapes
+ * unchanged). VitaClaw dedups by source_record_id.
  *
- * A type whose permission is not granted is skipped, not an error
- * (contract rule 6: partial batches are valid).
+ * Each type's read window is:
+ *   [cursor - 48h, min(now, cursor + 7d)]
  *
- * Each record's data carries "device" (manufacturer, model, type) when the
- * app that wrote it to Health Connect recorded one; it is left out when not.
- * VitaClaw stores data as given, so no receiver change is needed.
+ * The 48h backward overlap catches readings that watches (e.g. Garmin
+ * Connect) write to Health Connect hours after their own timestamp; those
+ * records would otherwise be skipped forever once the cursor passed them.
+ * Duplicates in the overlap are dropped by VitaClaw.
+ *
+ * The 7-day forward cap chunks a long catch-up (first run from 30 days
+ * behind, or a Proton-VPN gap) into bites small enough to send reliably on
+ * one connection. The caller advances the cursor to the chunk's actual end,
+ * not to now, so a 30-day backlog clears in about five sends.
+ *
+ * A type whose permission is not granted is skipped (contract rule 6:
+ * partial batches are valid) and is left out of windowEnds, so its cursor
+ * stays where it was.
  */
 object ExportBuilder {
 
-    private val HEART_RATE_WINDOW: Duration = Duration.ofHours(48)
-    private val SLEEP_WINDOW: Duration = Duration.ofDays(7)
-    private val SPO2_WINDOW: Duration = Duration.ofDays(7)
-    private val EXERCISE_WINDOW: Duration = Duration.ofDays(14)
+    const val MAX_CHUNK_DAYS = 7L
+    const val OVERLAP_HOURS = 48L
+    val TYPES = listOf("heart_rate", "sleep_session", "oxygen_saturation", "exercise_session",
+        "resting_heart_rate", "steps")
+
+    data class Result(val json: JSONObject, val windowEnds: Map<String, Instant>)
 
     private fun base(type: String, app: String, id: String, recordedAt: Instant) =
         JSONObject().apply {
@@ -53,7 +67,6 @@ object ExportBuilder {
         else -> "unknown"
     }
 
-    /** Adds "device" to a record's data when Health Connect has one for it. */
     private fun JSONObject.withDevice(metadata: Metadata): JSONObject {
         val device = metadata.device ?: return this
         if (device.manufacturer == null && device.model == null && device.type == Device.TYPE_UNKNOWN) return this
@@ -65,72 +78,139 @@ object ExportBuilder {
         return this
     }
 
-    private suspend fun <T> readOrSkip(block: suspend () -> List<T>): List<T> =
-        try {
-            block()
-        } catch (e: SecurityException) {
-            emptyList()
+    private data class Window(val readStart: Instant, val readEnd: Instant)
+
+    private fun window(cursor: Instant, now: Instant, maxChunkDays: Long, overlapHours: Long): Window {
+        val readStart = cursor.minus(Duration.ofHours(overlapHours))
+        val chunkEnd = cursor.plus(Duration.ofDays(maxChunkDays))
+        val readEnd = if (chunkEnd.isBefore(now)) chunkEnd else now
+        return Window(readStart, readEnd)
+    }
+
+    suspend fun build(
+        manager: HealthConnectManager,
+        now: Instant = Instant.now(),
+        maxChunkDays: Long = MAX_CHUNK_DAYS,
+        overlapHours: Long = OVERLAP_HOURS,
+        cursorFor: (String) -> Instant
+    ): Result {
+        val records = JSONArray()
+        val windowEnds = mutableMapOf<String, Instant>()
+
+        run {
+            val type = "heart_rate"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<HeartRateRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    rec.samples.forEach { sample ->
+                        records.put(base(type, rec.metadata.dataOrigin.packageName,
+                            rec.metadata.id, sample.time).apply {
+                            put("data", JSONObject().put("bpm", sample.beatsPerMinute).withDevice(rec.metadata))
+                        })
+                    }
+                }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
         }
 
-    suspend fun build(manager: HealthConnectManager, now: Instant = Instant.now()): JSONObject {
-        val records = JSONArray()
-
-        readOrSkip { manager.readRecords<HeartRateRecord>(now.minus(HEART_RATE_WINDOW), now) }
-            .forEach { rec ->
-                rec.samples.forEach { sample ->
-                    records.put(base("heart_rate", rec.metadata.dataOrigin.packageName,
-                        rec.metadata.id, sample.time).apply {
-                        put("data", JSONObject().put("bpm", sample.beatsPerMinute).withDevice(rec.metadata))
+        run {
+            val type = "sleep_session"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<SleepSessionRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    records.put(base(type, rec.metadata.dataOrigin.packageName,
+                        rec.metadata.id, rec.startTime).apply {
+                        put("data", JSONObject().apply {
+                            put("start_time", rec.startTime.toString())
+                            put("end_time", rec.endTime.toString())
+                            put("stage_count", rec.stages.size)
+                            put("stages", JSONArray().apply {
+                                rec.stages.forEach { stage ->
+                                    put(JSONObject().apply {
+                                        put("stage_type", stage.stage)
+                                        put("start_time", stage.startTime.toString())
+                                        put("end_time", stage.endTime.toString())
+                                    })
+                                }
+                            })
+                        }.withDevice(rec.metadata))
                     })
                 }
-            }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
+        }
 
-        readOrSkip { manager.readRecords<SleepSessionRecord>(now.minus(SLEEP_WINDOW), now) }
-            .forEach { rec ->
-                records.put(base("sleep_session", rec.metadata.dataOrigin.packageName,
-                    rec.metadata.id, rec.startTime).apply {
-                    put("data", JSONObject().apply {
-                        put("start_time", rec.startTime.toString())
-                        put("end_time", rec.endTime.toString())
-                        put("stage_count", rec.stages.size)
-                        put("stages", JSONArray().apply {
-                            rec.stages.forEach { stage ->
-                                put(JSONObject().apply {
-                                    put("stage_type", stage.stage)
-                                    put("start_time", stage.startTime.toString())
-                                    put("end_time", stage.endTime.toString())
-                                })
-                            }
-                        })
-                    }.withDevice(rec.metadata))
-                })
-            }
+        run {
+            val type = "oxygen_saturation"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<OxygenSaturationRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    records.put(base(type, rec.metadata.dataOrigin.packageName,
+                        rec.metadata.id, rec.time).apply {
+                        put("data", JSONObject().put("percentage", rec.percentage.value).withDevice(rec.metadata))
+                    })
+                }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
+        }
 
-        readOrSkip { manager.readRecords<OxygenSaturationRecord>(now.minus(SPO2_WINDOW), now) }
-            .forEach { rec ->
-                records.put(base("oxygen_saturation", rec.metadata.dataOrigin.packageName,
-                    rec.metadata.id, rec.time).apply {
-                    put("data", JSONObject().put("percentage", rec.percentage.value).withDevice(rec.metadata))
-                })
-            }
+        run {
+            val type = "exercise_session"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<ExerciseSessionRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    records.put(base(type, rec.metadata.dataOrigin.packageName,
+                        rec.metadata.id, rec.startTime).apply {
+                        put("data", JSONObject().apply {
+                            put("start_time", rec.startTime.toString())
+                            put("end_time", rec.endTime.toString())
+                            put("exercise_type", rec.exerciseType)
+                        }.withDevice(rec.metadata))
+                    })
+                }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
+        }
 
-        readOrSkip { manager.readRecords<ExerciseSessionRecord>(now.minus(EXERCISE_WINDOW), now) }
-            .forEach { rec ->
-                records.put(base("exercise_session", rec.metadata.dataOrigin.packageName,
-                    rec.metadata.id, rec.startTime).apply {
-                    put("data", JSONObject().apply {
-                        put("start_time", rec.startTime.toString())
-                        put("end_time", rec.endTime.toString())
-                        put("exercise_type", rec.exerciseType)
-                    }.withDevice(rec.metadata))
-                })
-            }
+        run {
+            val type = "resting_heart_rate"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<RestingHeartRateRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    records.put(base(type, rec.metadata.dataOrigin.packageName,
+                        rec.metadata.id, rec.time).apply {
+                        put("data", JSONObject().put("bpm", rec.beatsPerMinute).withDevice(rec.metadata))
+                    })
+                }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
+        }
 
-        return JSONObject().apply {
-            put("_note", "VitaSync v1 export: heart_rate, sleep_session, oxygen_saturation, exercise_session.")
-            put("sync_run_at", Instant.now().toString())
+        run {
+            // Interval record (like a session): data_recorded_at = start, data carries start/end/count.
+            val type = "steps"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<StepsRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    records.put(base(type, rec.metadata.dataOrigin.packageName,
+                        rec.metadata.id, rec.startTime).apply {
+                        put("data", JSONObject().apply {
+                            put("start_time", rec.startTime.toString())
+                            put("end_time", rec.endTime.toString())
+                            put("count", rec.count)
+                        }.withDevice(rec.metadata))
+                    })
+                }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
+        }
+
+        val json = JSONObject().apply {
+            put("_note", "VitaSync v1 export: heart_rate, sleep_session, oxygen_saturation, exercise_session, resting_heart_rate, steps.")
+            put("sync_run_at", now.toString())
             put("schema_version", 1)
             put("records", records)
         }
+        return Result(json, windowEnds)
     }
 }
