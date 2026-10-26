@@ -3,7 +3,9 @@ package com.vitasync
 import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.OxygenSaturationRecord
+import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
+import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.metadata.Device
 import androidx.health.connect.client.records.metadata.Metadata
 import org.json.JSONArray
@@ -13,8 +15,9 @@ import java.time.Instant
 
 /**
  * Builds the v1 export (schema_version 1): heart_rate, sleep_session,
- * oxygen_saturation, exercise_session. Record shape unchanged from the
- * 9 October 2026 export — VitaClaw dedups by source_record_id.
+ * oxygen_saturation, exercise_session, plus resting_heart_rate and steps
+ * (added 26 Oct 2026: Garmin writes both; additive, existing record shapes
+ * unchanged). VitaClaw dedups by source_record_id.
  *
  * Each type's read window is:
  *   [cursor - 48h, min(now, cursor + 7d)]
@@ -37,7 +40,8 @@ object ExportBuilder {
 
     const val MAX_CHUNK_DAYS = 7L
     const val OVERLAP_HOURS = 48L
-    val TYPES = listOf("heart_rate", "sleep_session", "oxygen_saturation", "exercise_session")
+    val TYPES = listOf("heart_rate", "sleep_session", "oxygen_saturation", "exercise_session",
+        "resting_heart_rate", "steps")
 
     data class Result(val json: JSONObject, val windowEnds: Map<String, Instant>)
 
@@ -85,10 +89,10 @@ object ExportBuilder {
 
     suspend fun build(
         manager: HealthConnectManager,
-        cursorFor: (String) -> Instant,
         now: Instant = Instant.now(),
         maxChunkDays: Long = MAX_CHUNK_DAYS,
-        overlapHours: Long = OVERLAP_HOURS
+        overlapHours: Long = OVERLAP_HOURS,
+        cursorFor: (String) -> Instant
     ): Result {
         val records = JSONArray()
         val windowEnds = mutableMapOf<String, Instant>()
@@ -168,8 +172,41 @@ object ExportBuilder {
             } catch (_: SecurityException) { }
         }
 
+        run {
+            val type = "resting_heart_rate"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<RestingHeartRateRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    records.put(base(type, rec.metadata.dataOrigin.packageName,
+                        rec.metadata.id, rec.time).apply {
+                        put("data", JSONObject().put("bpm", rec.beatsPerMinute).withDevice(rec.metadata))
+                    })
+                }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
+        }
+
+        run {
+            // Interval record (like a session): data_recorded_at = start, data carries start/end/count.
+            val type = "steps"
+            val w = window(cursorFor(type), now, maxChunkDays, overlapHours)
+            try {
+                manager.readRecords<StepsRecord>(w.readStart, w.readEnd).forEach { rec ->
+                    records.put(base(type, rec.metadata.dataOrigin.packageName,
+                        rec.metadata.id, rec.startTime).apply {
+                        put("data", JSONObject().apply {
+                            put("start_time", rec.startTime.toString())
+                            put("end_time", rec.endTime.toString())
+                            put("count", rec.count)
+                        }.withDevice(rec.metadata))
+                    })
+                }
+                windowEnds[type] = w.readEnd
+            } catch (_: SecurityException) { }
+        }
+
         val json = JSONObject().apply {
-            put("_note", "VitaSync v1 export: heart_rate, sleep_session, oxygen_saturation, exercise_session.")
+            put("_note", "VitaSync v1 export: heart_rate, sleep_session, oxygen_saturation, exercise_session, resting_heart_rate, steps.")
             put("sync_run_at", now.toString())
             put("schema_version", 1)
             put("records", records)

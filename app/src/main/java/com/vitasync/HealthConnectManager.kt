@@ -51,12 +51,14 @@ class HealthConnectManager(private val context: Context) {
     val permissions: Set<String> =
         metrics.map { HealthPermission.getReadPermission(it.recordType) }.toSet()
 
-    /** The four types sent to VitaClaw (v1 contract). */
+    /** The types sent to VitaClaw: v1 contract four + resting_heart_rate and steps (26 Oct 2026, Garmin). */
     val exportPermissions: Set<String> = setOf(
         HealthPermission.getReadPermission(HeartRateRecord::class),
         HealthPermission.getReadPermission(SleepSessionRecord::class),
         HealthPermission.getReadPermission(OxygenSaturationRecord::class),
-        HealthPermission.getReadPermission(ExerciseSessionRecord::class)
+        HealthPermission.getReadPermission(ExerciseSessionRecord::class),
+        HealthPermission.getReadPermission(RestingHeartRateRecord::class),
+        HealthPermission.getReadPermission(StepsRecord::class)
     )
 
     /** Lets the daily job read while the app is closed (Health Connect feature). */
